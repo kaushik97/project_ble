@@ -8,6 +8,7 @@
 #include "common.h"
 #include "temperature.h"
 #include "host/ble_gatt.h"
+#include "gap.h"
 
 /* Private function declarations */
 // static int heart_rate_chr_access(uint16_t conn_handle, uint16_t attr_handle,
@@ -63,7 +64,7 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
             {
               .uuid = &temperature_chr_uuid.u,
               .access_cb = temperature_chr_access,
-              .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_INDICATE,
+              .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_INDICATE | BLE_GATT_CHR_F_READ_ENC,
               .val_handle = &temperature_chr_val_handle,
 
               .descriptors = (struct ble_gatt_dsc_def[]) { {
@@ -192,9 +193,9 @@ void gatt_svr_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg) {
     }
 }
 
-void gatt_svr_subscribe_cb(struct ble_gap_event *event) {
+int gatt_svr_subscribe_cb(struct ble_gap_event *event) {
     if(event == NULL) {
-        return;
+        return 0;
     }
 
     if (event->subscribe.conn_handle != BLE_HS_CONN_HANDLE_NONE) {
@@ -209,7 +210,14 @@ void gatt_svr_subscribe_cb(struct ble_gap_event *event) {
         temperature_chr_conn_handle = event->subscribe.conn_handle;
         temperature_chr_conn_handle_inited = true;
         temperature_ind_status = event->subscribe.cur_indicate;
+
+        if (!is_connection_encrypted(event->subscribe.conn_handle)) {
+            ESP_LOGE(TAG, "failed to subscribe to heart rate measurement, "
+                          "connection not encrypted!");
+            return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+        }
     }
+    return 0;
 }
 
 void gatt_svr_reset_temperature_subscription(void) {

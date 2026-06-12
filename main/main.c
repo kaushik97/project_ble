@@ -54,6 +54,10 @@ static void nimble_host_config_init(void) {
     ble_hs_cfg.gatts_register_cb = gatt_svr_register_cb;
     ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
 
+    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO; // Or your specific IO cap
+    ble_hs_cfg.sm_bonding = 1;                  // CRITICAL: Must be 1, not 0!
+    ble_hs_cfg.sm_mitm = 1;                     // Man-in-the-middle protection
+    ble_hs_cfg.sm_sc = 1;
     /* Store host configuration */
     ble_store_config_init();
 }
@@ -62,6 +66,9 @@ void app_main(void)
 {
     BaseType_t rc = 0;
     esp_err_t ret;
+
+    uint32_t seed = esp_random();
+    srand(seed);
 
     ret = nvs_flash_init();
 

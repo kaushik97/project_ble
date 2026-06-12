@@ -12,5 +12,6 @@ int gap_init();
 
 void adv_init(void);
 int gap_init(void);
-
+bool is_connection_encrypted(uint16_t conn_handle);
+ 
 #endif

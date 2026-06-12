@@ -1,16 +1,22 @@
 #include "gap.h"
 #include "common.h"
 #include "gatt_svc.h"
+#include "freertos/timers.h"
 
 /* Private function declarations */
 inline static void format_addr(char *addr_str, uint8_t addr[]);
 static void print_conn_desc(struct ble_gap_conn_desc *desc);
 static void start_advertising(void);
 static int gap_event_handler(struct ble_gap_event *event, void *arg);
+static void set_random_addr(void);
 
 static uint8_t own_addr_type;
 static uint8_t addr_val[6] = {0};
 static uint8_t esp_uri[] = {BLE_GAP_URI_PREFIX_HTTPS, '/', '/', 'e', 's', 'p', 'r', 'e', 's', 's', 'i', 'f', '.', 'c', 'o', 'm'};
+
+// This is your actual timer handle variable
+static TimerHandle_t param_update_timer = NULL;
+static uint16_t current_conn_handle = 0;
 
 /* Private functions */
 inline static void format_addr(char *addr_str, uint8_t addr[]) {
@@ -42,6 +48,20 @@ static void print_conn_desc(struct ble_gap_conn_desc *desc) {
              desc->conn_itvl, desc->conn_latency, desc->supervision_timeout,
              desc->sec_state.encrypted, desc->sec_state.authenticated,
              desc->sec_state.bonded);
+}
+
+static void set_random_addr(void) {
+    /* Local variables */
+    int rc = 0;
+    ble_addr_t addr;
+
+    /* Generate new non-resolvable private address */
+    rc = ble_hs_id_gen_rnd(0, &addr);
+    assert(rc == 0);
+
+    /* Set address */
+    rc = ble_hs_id_set_rnd(addr.val);
+    assert(rc == 0);
 }
 
 static void start_advertising(void) {
@@ -117,6 +137,34 @@ static void start_advertising(void) {
     ESP_LOGI(TAG, "advertising started!");
 }
 
+static void vParamUpdateTimerCallback(TimerHandle_t xTimer) {
+     /* Check connection handle */
+    struct ble_gap_conn_desc desc;
+    int rc = ble_gap_conn_find(current_conn_handle, &desc);
+    if (rc != 0) {
+        ESP_LOGE(TAG,
+                    "failed to find connection by handle, error code: %d",
+                    rc);
+    }
+
+    /* Print connection descriptor */
+    print_conn_desc(&desc);
+
+    /* Try to update connection parameters */
+    struct ble_gap_upd_params params = {.itvl_min = desc.conn_itvl,
+                                        .itvl_max = desc.conn_itvl,
+                                        .latency = 3,
+                                        .supervision_timeout =
+                                            desc.supervision_timeout};
+    rc = ble_gap_update_params(current_conn_handle, &params);
+    if (rc != 0) {
+        ESP_LOGE(
+            TAG,
+            "failed to update connection parameters, error code: %d",
+            rc);
+    }
+}
+
 static int gap_event_handler(struct ble_gap_event *event, void *arg) {
     /* Local variables */
     int rc = 0;
@@ -134,31 +182,35 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
 
         /* Connection succeeded */
         if (event->connect.status == 0) {
-            /* Check connection handle */
-            rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
+            int rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
             if (rc != 0) {
                 ESP_LOGE(TAG,
-                         "failed to find connection by handle, error code: %d",
-                         rc);
+                            "failed to find connection by handle, error code: %d",
+                            rc);
                 return rc;
             }
 
             /* Print connection descriptor */
             print_conn_desc(&desc);
 
-            /* Try to update connection parameters */
-            struct ble_gap_upd_params params = {.itvl_min = desc.conn_itvl,
-                                                .itvl_max = desc.conn_itvl,
-                                                .latency = 3,
-                                                .supervision_timeout =
-                                                    desc.supervision_timeout};
-            rc = ble_gap_update_params(event->connect.conn_handle, &params);
-            if (rc != 0) {
-                ESP_LOGE(
-                    TAG,
-                    "failed to update connection parameters, error code: %d",
-                    rc);
-                return rc;
+            // Capture the connection handle globally
+            current_conn_handle = event->connect.conn_handle;
+
+            // Instantiate the one-shot timer if it doesn't exist
+            if (param_update_timer == NULL) {
+                param_update_timer = xTimerCreate(
+                    "ParamUpdateTimer",           // Timer name string
+                    pdMS_TO_TICKS(2000),          // 2-second safety delay
+                    pdFALSE,                      // Auto-reload? pdFALSE = run once
+                    (void *)0,                    // ID
+                    vParamUpdateTimerCallback     // The callback we wrote in Step 2
+                );
+            }
+
+            // Start the delay countdown
+            if (param_update_timer != NULL) {
+                xTimerStart(param_update_timer, 0);
+                MODLOG_DFLT(INFO, "Triggered 2-second security lock delay timer.\n");
             }
         }
         /* Connection failed, restart advertising */
@@ -173,7 +225,7 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
         ESP_LOGI(TAG, "disconnected from peer; reason=%d",
                  event->disconnect.reason);
 
-        /* Reset heart rate subscription state */
+        /* Reset temperature subscription state */
         gatt_svr_reset_temperature_subscription();
 
         /* Restart advertising */
@@ -229,7 +281,11 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
                  event->subscribe.cur_indicate);
 
         /* GATT subscribe event callback */
-        gatt_svr_subscribe_cb(event);
+        rc = gatt_svr_subscribe_cb(event);
+        if (rc == BLE_ATT_ERR_INSUFFICIENT_AUTHEN) {
+            /* Request connection encryption */
+            return ble_gap_security_initiate(event->subscribe.conn_handle);
+        }
         return rc;
 
     /* MTU update event */
@@ -239,6 +295,53 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
                  event->mtu.conn_handle, event->mtu.channel_id,
                  event->mtu.value);
         return rc;
+
+    /* Encryption change event */
+    case BLE_GAP_EVENT_ENC_CHANGE:
+        /* Encryption has been enabled or disabled for this connection. */
+        if (event->enc_change.status == 0) {
+            ESP_LOGI(TAG, "connection encrypted!");
+        } else {
+            ESP_LOGE(TAG, "connection encryption failed, status: %d",
+                     event->enc_change.status);
+        }
+        return rc;
+        
+    /* Repeat pairing event */
+    case BLE_GAP_EVENT_REPEAT_PAIRING:
+        /* Delete the old bond */
+        rc = ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "failed to find connection, error code %d", rc);
+            return rc;
+        }
+        ble_store_util_delete_peer(&desc.peer_id_addr);
+
+        /* Return BLE_GAP_REPEAT_PAIRING_RETRY to indicate that the host should
+         * continue with pairing operation */
+        ESP_LOGI(TAG, "repairing...");
+        return BLE_GAP_REPEAT_PAIRING_RETRY;
+
+    /* Passkey action event */
+    case BLE_GAP_EVENT_PASSKEY_ACTION:
+        /* Display action */
+        if (event->passkey.params.action == BLE_SM_IOACT_DISP) {
+            /* Generate passkey */
+            struct ble_sm_io pkey = {0};
+            pkey.action = event->passkey.params.action;
+            pkey.passkey = 100000 + esp_random() % 900000;
+            ESP_LOGI(TAG, "enter passkey %" PRIu32 " on the peer side",
+                     pkey.passkey);
+            rc = ble_sm_inject_io(event->passkey.conn_handle, &pkey);
+            if (rc != 0) {
+                ESP_LOGE(TAG,
+                         "failed to inject security manager io, error code: %d",
+                         rc);
+                return rc;
+            }
+        }
+        return rc;
+
     }
 
     return rc;
@@ -251,7 +354,8 @@ void adv_init(void) {
     char addr_str[18] = {0};
 
     /* Make sure we have proper BT identity address set (random preferred) */
-    rc = ble_hs_util_ensure_addr(0);
+    set_random_addr();
+    rc = ble_hs_util_ensure_addr(1);
     if (rc != 0) {
         ESP_LOGE(TAG, "device does not have any available bt address!");
         return;
@@ -275,6 +379,22 @@ void adv_init(void) {
 
     /* Start advertising. */
     start_advertising();
+}
+
+bool is_connection_encrypted(uint16_t conn_handle) {
+    /* Local variables */
+    int rc = 0;
+    struct ble_gap_conn_desc desc;
+
+    /* Print connection descriptor */
+    rc = ble_gap_conn_find(conn_handle, &desc);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "failed to find connection by handle, error code: %d",
+                 rc);
+        return false;
+    }
+
+    return desc.sec_state.encrypted;
 }
 
 // Initialise device name 

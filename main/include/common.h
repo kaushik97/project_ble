@@ -11,6 +11,7 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
+#include "esp_random.h"
 
 // FREERTOS APIs
 #include <freertos/FreeRTOS.h>
